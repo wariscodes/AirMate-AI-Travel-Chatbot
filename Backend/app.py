@@ -1,41 +1,74 @@
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import joblib
-from pathlib import Path
 
 app = Flask(__name__)
 CORS(app)
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-MODEL_PATH = BASE_DIR / "Model" / "chatbot_model.pkl"
-model = joblib.load(MODEL_PATH)
-
-# Temporary conversation memory; resets when Flask restarts.
+# Store conversation details temporarily
 conversations = {}
 
 
-def get_request_data():
-    return request.get_json(silent=True) or {}
-
-
+# Check whether backend is running
 @app.route("/health", methods=["GET"])
-def health_check():
+def health():
     return jsonify({
         "status": "healthy",
         "message": "Chatbot API is running"
     })
 
 
+# Identify user request
+def detect_intent(message):
+    message = message.lower()
+
+    if any(word in message for word in ["cancel", "cancellation"]):
+        return "cancel"
+
+    if any(word in message for word in ["change", "modify", "reschedule"]):
+        return "change"
+
+    if any(word in message for word in ["book", "booking", "reserve"]):
+        return "book"
+
+    return "unknown"
+
+
+# Questions for each request
+questions = {
+    "book": {
+        "departure": "Which city are you departing from?",
+        "destination": "Where would you like to go?",
+        "date": "What is your travel date?",
+        "passengers": "How many passengers will travel?"
+    },
+    "cancel": {
+        "booking_reference": "Please provide your booking reference."
+    },
+    "change": {
+        "booking_reference": "Please provide your booking reference.",
+        "new_date": "What is your new travel date?"
+    }
+}
+
+
+# Return the next question
+def get_question(intent, step):
+    return questions[intent][step]
+
+
+# Intent prediction endpoint
 @app.route("/predict", methods=["POST"])
-def predict_intent():
-    data = get_request_data()
-    message = str(data.get("message", "")).strip()
+def predict():
+    data = request.get_json(silent=True) or {}
+
+    message = data.get("message", "").strip()
 
     if not message:
-        return jsonify({"error": "Message is required"}), 400
+        return jsonify({
+            "error": "Please enter a message"
+        }), 400
 
-    intent = str(model.predict([message])[0])
+    intent = detect_intent(message)
 
     return jsonify({
         "message": message,
@@ -43,125 +76,150 @@ def predict_intent():
     })
 
 
+# Main chatbot endpoint
 @app.route("/chat", methods=["POST"])
 def chat():
-    data = get_request_data()
-    message = str(data.get("message", "")).strip()
-    conversation_id = str(data.get("conversation_id", "")).strip()
+    data = request.get_json(silent=True) or {}
 
-    if not message or not conversation_id:
+    message = data.get("message", "").strip()
+    conversation_id = data.get("conversation_id", "default")
+
+    if not message:
         return jsonify({
-            "error": "Message and conversation_id are required"
+            "reply": "Please enter your request."
         }), 400
 
-    state = conversations.get(conversation_id)
+    # Create conversation if it does not exist
+    if conversation_id not in conversations:
+        conversations[conversation_id] = {
+            "intent": None,
+            "step": None,
+            "details": {}
+        }
 
-    # Start a new request if no conversation is active.
-    if state is None or state["stage"] in {"complete", "cancelled"}:
-        intent = str(model.predict([message])[0])
-        state = {"intent": intent, "stage": "", "details": {}}
-        conversations[conversation_id] = state
+    conversation = conversations[conversation_id]
 
-        if intent == "book":
-            state["stage"] = "departure_city"
-            reply = "Sure! Which city will you depart from?"
-        elif intent == "cancel":
-            state["stage"] = "booking_reference_cancel"
-            reply = "I can prepare a cancellation request. What is your booking reference?"
-        elif intent == "change":
-            state["stage"] = "booking_reference_change"
-            reply = "I can prepare a change request. What is your booking reference?"
-        else:
-            state["stage"] = "complete"
-            reply = "I can help with booking, cancellation, or changing a reservation. Which do you need?"
+    # Identify intent
+    if conversation["intent"] is None:
 
-        return jsonify({
-            "reply": reply,
-            "intent": intent,
-            "complete": False
-        })
+        intent = detect_intent(message)
 
-    stage = state["stage"]
-    details = state["details"]
-
-    if stage == "departure_city":
-        details["departure_city"] = message
-        state["stage"] = "destination_city"
-        reply = "Which city would you like to travel to?"
-
-    elif stage == "destination_city":
-        details["destination_city"] = message
-        state["stage"] = "travel_date"
-        reply = "What date would you like to travel?"
-
-    elif stage == "travel_date":
-        details["travel_date"] = message
-        state["stage"] = "passengers"
-        reply = "How many passengers will be travelling?"
-
-    elif stage == "passengers":
-        details["passengers"] = message
-        state["stage"] = "complete"
-        reply = (
-            "Your flight request details:\n"
-            f"From: {details['departure_city']}\n"
-            f"To: {details['destination_city']}\n"
-            f"Date: {details['travel_date']}\n"
-            f"Passengers: {details['passengers']}\n\n"
-            "This is only a prepared request. No flight has been booked."
-        )
-
-    elif stage == "booking_reference_cancel":
-        details["booking_reference"] = message
-        state["stage"] = "confirm_cancel"
-        reply = "Prepare a cancellation request for this reference? Reply yes or no."
-
-    elif stage == "confirm_cancel":
-        if message.lower() in {"yes", "y", "yes please", "confirm"}:
-            state["stage"] = "complete"
+        if intent == "unknown":
             reply = (
-                f"Cancellation request prepared for reference "
-                f"{details['booking_reference']}. No actual reservation was cancelled."
+                "I can help with flight booking, cancellation, "
+                "or changing a booking. What would you like to do?"
             )
+
         else:
-            state["stage"] = "cancelled"
-            reply = "Okay, cancellation request not prepared."
+            conversation["intent"] = intent
+            conversation["details"] = {}
 
-    elif stage == "booking_reference_change":
-        details["booking_reference"] = message
-        state["stage"] = "new_travel_date"
-        reply = "What new travel date would you like to request?"
+            if intent == "book":
+                conversation["step"] = "departure"
 
-    elif stage == "new_travel_date":
-        details["new_travel_date"] = message
-        state["stage"] = "confirm_change"
-        reply = (
-            f"Prepare a change request for booking "
-            f"{details['booking_reference']} with the new date {message}? Reply yes or no."
-        )
+            elif intent == "cancel":
+                conversation["step"] = "booking_reference"
 
-    elif stage == "confirm_change":
-        if message.lower() in {"yes", "y", "yes please", "confirm"}:
-            state["stage"] = "complete"
-            reply = (
-                f"Change request prepared for booking {details['booking_reference']} "
-                f"with requested date {details['new_travel_date']}. "
-                "No actual reservation was changed."
+            else:
+                conversation["step"] = "booking_reference"
+
+            reply = get_question(
+                intent,
+                conversation["step"]
             )
-        else:
-            state["stage"] = "cancelled"
-            reply = "Okay, change request not prepared."
 
     else:
-        state["stage"] = "complete"
-        reply = "This conversation has ended. Start a new request."
+
+        # Save user's answer
+        current_step = conversation["step"]
+
+        conversation["details"][current_step] = message
+
+        intent = conversation["intent"]
+
+        # Define question order
+        if intent == "book":
+            steps = [
+                "departure",
+                "destination",
+                "date",
+                "passengers"
+            ]
+
+        elif intent == "cancel":
+            steps = [
+                "booking_reference"
+            ]
+
+        else:
+            steps = [
+                "booking_reference",
+                "new_date"
+            ]
+
+        # Find next question
+        current_index = steps.index(current_step)
+
+        if current_index + 1 < len(steps):
+
+            next_step = steps[current_index + 1]
+
+            conversation["step"] = next_step
+
+            reply = get_question(
+                intent,
+                next_step
+            )
+
+        else:
+
+            details = conversation["details"]
+
+            # Prepare booking request
+            if intent == "book":
+
+                reply = (
+                    "Your flight request has been prepared!\n\n"
+                    f"Departure: {details['departure']}\n"
+                    f"Destination: {details['destination']}\n"
+                    f"Travel Date: {details['date']}\n"
+                    f"Passengers: {details['passengers']}\n\n"
+                    "This is a prototype. No actual ticket has been booked."
+                )
+
+            # Prepare cancellation request
+            elif intent == "cancel":
+
+                reply = (
+                    "Your cancellation request has been prepared.\n\n"
+                    f"Booking Reference: "
+                    f"{details['booking_reference']}\n\n"
+                    "No actual flight has been cancelled."
+                )
+
+            # Prepare change request
+            else:
+
+                reply = (
+                    "Your flight change request has been prepared.\n\n"
+                    f"Booking Reference: "
+                    f"{details['booking_reference']}\n"
+                    f"New Travel Date: {details['new_date']}\n\n"
+                    "No actual flight has been changed."
+                )
+
+            # Reset conversation after completion
+            conversation["intent"] = None
+            conversation["step"] = None
+            conversation["details"] = {}
 
     return jsonify({
         "reply": reply,
-        "intent": None,
-        "complete": state["stage"] in {"complete", "cancelled"}
+        "intent": conversation["intent"],
+        "complete": conversation["step"] is None
     })
 
 
+# Start Flask server
 if __name__ == "__main__":
     app.run(debug=True)
